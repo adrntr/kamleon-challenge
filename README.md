@@ -78,6 +78,42 @@ curl -i http://localhost:8000/customers/{customer_id}
 # 404 customer-not-found
 ```
 
+### Devices
+
+Register a device for a customer. It starts as `active`.
+
+```bash
+curl -i -X POST http://localhost:8000/customers/{customer_id}/devices \
+  -H 'Content-Type: application/json' \
+  -d '{"serial_number": "KM123"}'
+# 201 + Location: /devices/{id}
+# 404 customer-not-found, 409 serial-already-registered, 422 validation-error
+```
+
+List the devices of a customer.
+
+```bash
+curl -i http://localhost:8000/customers/{customer_id}/devices
+# 200 {"items": [...]}
+# 404 customer-not-found
+```
+
+Retrieve a device by id.
+
+```bash
+curl -i http://localhost:8000/devices/{device_id}
+# 200
+# 404 device-not-found
+```
+
+Find a device by serial number (the list is empty if none matches).
+
+```bash
+curl -i 'http://localhost:8000/devices?serial_number=KM123'
+# 200 {"items": [...]}
+# 422 validation-error if serial_number is missing or empty
+```
+
 ### Errors
 
 Every error response is an RFC 9457 problem details document (`application/problem+json`):

@@ -23,3 +23,13 @@ class CustomerNotFoundError(DomainError):
 class EmailAlreadyRegisteredError(DomainError):
     def __init__(self, email: str) -> None:
         super().__init__(f"A customer with email {email} is already registered")
+
+
+class DeviceNotFoundError(DomainError):
+    def __init__(self, device_id: object) -> None:
+        super().__init__(f"Device {device_id} does not exist")
+
+
+class SerialAlreadyRegisteredError(DomainError):
+    def __init__(self, serial_number: str) -> None:
+        super().__init__(f"A device with serial {serial_number} is already registered")

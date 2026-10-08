@@ -14,8 +14,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.domain.errors import (
     CustomerNotFoundError,
     DatabaseUnavailableError,
+    DeviceNotFoundError,
     DomainError,
     EmailAlreadyRegisteredError,
+    SerialAlreadyRegisteredError,
 )
 from app.schemas.problem import ProblemDetails
 
@@ -47,6 +49,10 @@ DOMAIN_PROBLEMS: dict[type[DomainError], ProblemType] = {
     CustomerNotFoundError: ProblemType(404, "customer-not-found", "Customer not found"),
     EmailAlreadyRegisteredError: ProblemType(
         409, "email-already-registered", "Email already registered"
+    ),
+    DeviceNotFoundError: ProblemType(404, "device-not-found", "Device not found"),
+    SerialAlreadyRegisteredError: ProblemType(
+        409, "serial-already-registered", "Serial number already registered"
     ),
 }
 
