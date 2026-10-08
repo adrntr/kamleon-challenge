@@ -1,0 +1,51 @@
+x-app: &app
+  build: .
+  image: kamleon-challenge-api:local
+  environment:
+    DATABASE_URL: postgresql+psycopg://kamleon:kamleon@db:5432/kamleon
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: kamleon
+      POSTGRES_PASSWORD: kamleon
+      POSTGRES_DB: kamleon
+    ports:
+      # Published so tests and Alembic can run from the host.
+      - "${DB_HOST_PORT:-5432}:5432"
+    volumes:
+      # postgres:18 keeps its data in a versioned subdirectory of /var/lib/postgresql.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kamleon -d kamleon"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=2)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:

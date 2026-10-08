@@ -3,7 +3,24 @@ Each decision lists the rejected alternatives and the reason.
 
 ## Data model
 
+### Tables
+
+| Table               | Columns                                                                          |
+| ------------------- | -------------------------------------------------------------------------------- |
+| `customers`         | `id`, `name`, `email`, `created_at`                                              |
+| `devices`           | `id`, `customer_id`, `serial_number`, `status`, `created_at`, `updated_at`       |
+| `measurement_types` | `type`, `unit`                                                                   |
+| `measurements`      | `id`, `device_id`, `device_measurement_id`, `type`, `unit`, `value`, `timestamp` |
+
+- Every column is `NOT NULL`. Types are justified in the sections below.
+- **Only the columns the requirements ask for, plus `device_measurement_id`** (idempotency) and the `measurement_types` lookup table (valid type/unit pairs).
+- **No `customers.updated_at`:** there is no endpoint that modifies a customer, so the column would always equal `created_at`. It is added together with the first update endpoint.
+- **No `measurements.created_at`:** no query needs the ingestion time; if it is ever needed, it is embedded in the UUIDv7 id.
+- **`devices.updated_at`** is set by the application on every update (`server_default now()` plus the ORM's `onupdate`). **Known limitation:** an `UPDATE` run outside the application (e.g. by hand in `psql`) does not change it. A trigger would cover every writer, but business logic in triggers is avoided (see *Business rules*).
+
 ### Identifiers
+
+**All ids are generated in the application** (`uuid.uuid4()` for customers and devices, `uuid.uuid7()` for measurements). No id column has a server default, so an `INSERT` that omits the id fails with a `NOT NULL` violation.
 
 **customers.id — UUIDv4**
 - **Rejected alternative:** auto-increment integer (`bigint identity`).
@@ -17,11 +34,16 @@ Each decision lists the rejected alternatives and the reason.
 - **Rejected alternative**: uuidv7: provides information about the date of creation of the device and it is not needed based on the expected quantity of devices.
 
 
-**measurements.id — UUIDv7**
-- **Rejected alternative:** UUIDv4 (random).
+**measurements.id — UUIDv7, generated in the application** (`uuid.uuid7()`, Python 3.14)
 - **Why:** measurements is the highest-volume table and receives continuous inserts. UUIDv7 grows with time, so every insert lands on the last leaf of the PK index: that page is always in memory and fills almost completely before splitting. With UUIDv4 each insert lands on a random leaf. Once the index no longer fits in RAM, that means a random disk read per insert. Page splits spread across the whole tree also leave pages half full, so the index bloats and fits in memory even worse.
+- **Scope of the locality benefit:** it applies to the PK index only. The idempotency index `(device_id, device_measurement_id)` receives inserts at random positions within each device's range, since the firmware contract does not require time-ordered ids. `(device_id, "timestamp", type)` receives them at the end of each device's range, except for late uploads. The difference is only measurable once indexes no longer fit in memory. **Future improvement:** recommend UUIDv7 in the firmware contract, as a recommendation and not a requirement: a wrong device clock would only degrade index locality, never uniqueness.
+- **Rejected alternative:** UUIDv4 (random), for the insert behavior described above.
+- **Rejected alternative: `bigint identity`.** It also grows with time, so it has the same insert locality in the PK index, at half the size (8 bytes vs 16). Rejected because sequential ids exposed in API responses reveal measurement volume and ingestion rate, and because UUIDs are generated without coordination: rows produced by another process or database never collide.
+- **Generated in the application, not in the database:** the service builds every row before the `INSERT`, and the schema does not depend on the PostgreSQL version.
+  - **Rejected alternative: `uuidv7()` as a server default.** It would tie the schema to PostgreSQL 18+, a constraint if production runs on a managed database that does not offer it yet.
+  - **Trade-off accepted:** other writers (manual `INSERT`, load scripts) must supply the id explicitly. The column has no default, so omitting it fails with a `NOT NULL` violation instead of silently generating a value.
 - **Note:** queries order and filter by `timestamp` (when the device generated the measurement), not by id. UUIDv7 is chosen for index insert behavior, not for ordering.
-- **Privacy consideration:** a UUIDv7 embeds its creation time (first 48 bits, millisecond precision). Measurements are health-related data, so a measurement id appearing next to a `device_id` (e.g. in a URL written to access logs) reveals that a specific person took a measurement at an exact time, without exposing the value. This was evaluated and accepted: the request log line already carries its own timestamp and the `device_id` already identifies the person, so UUIDv4 would not remove the exposure. The actual risk is personal identifiers in logs, which is addressed by log hygiene (see README, GDPR section), not by the id type.
+- **Privacy consideration:** a UUIDv7 embeds its creation time (first 48 bits, millisecond precision). Since it is generated by the API, that is the ingestion time, not the measurement time. Measurements are health-related data, so a measurement id appearing next to a `device_id` (e.g. in a URL written to access logs) reveals that a specific person sent a measurement at an exact time, without exposing the value. This was evaluated and accepted: the request log line already carries its own timestamp and the `device_id` already identifies the person, so UUIDv4 would not remove the exposure. The actual risk is personal identifiers in logs, which is addressed by log hygiene (see README, GDPR section), not by the id type.
 
 ### Timestamps
 
@@ -89,8 +111,9 @@ CONSTRAINT measurements_type_unit_fkey
 ```
 
 - **What it guarantees:** a measurement can only be stored with a registered `(type, unit)` pair, so `('ph', 'mA')` is rejected even if `ph` and `mA` exist separately. The check happens only on insert/update: reads and filters by `type` need no join, since `type` and `unit` are stored as text in `measurements`.
-- **Several units per type are allowed.** This makes unit transitions possible without losing data (e.g. `current` from `mA` to `µA`):
-  1. a migration adds `('current', 'µA')`;
+- **Units are ASCII codes** (`degC`, `uA`, `mS/cm`), part of the ingestion contract. Rejected: Unicode symbols (`°C`, `µA`). `µ` has two Unicode code points that look identical (U+00B5 and U+03BC); a device sending the other one would be rejected as `unknown-type-unit` with no visible difference in logs. ASCII also avoids encoding issues in firmware.
+- **Several units per type are allowed.** This makes unit transitions possible without losing data (e.g. `current` from `mA` to `uA`):
+  1. a migration adds `('current', 'uA')`;
   2. devices are updated gradually while both units coexist;
   3. history is converted in batches; each row's `unit` says whether it is already converted;
   4. `('current', 'mA')` is removed. The FK prevents removing it while any measurement still uses it.
@@ -105,6 +128,15 @@ CONSTRAINT measurements_type_unit_fkey
 - **Rejected alternative: accepting any unit and converting on ingestion.** It adds conversion logic and its bugs to the API. A strict contract was preferred, with unit transitions handled by registering new pairs.
 - **Rejected alternative: lowercasing units, as done for emails.** Units are case-sensitive: `mA` is milliampere, `MA` is megaampere.
 - **Future improvement:** an authenticated admin endpoint to register measurement types without a migration.
+
+
+### Non-blank text columns
+
+**`CHECK (btrim(<column>) <> '')` on `customers.name`, `customers.email`, `devices.serial_number`, `measurement_types.type` and `measurement_types.unit`.**
+- `NOT NULL` does not reject an empty string. A blank serial number or name is never valid, so it is a data invariant enforced by the database (`AGENTS.md`, rule 1).
+- `btrim` also rejects whitespace-only values (`'   '`), which `<> ''` would accept.
+- The API schemas strip surrounding whitespace and require at least one character, so clients get a `422` with a clear message; the constraint guarantees it for every other writer.
+
 
 ----
 
@@ -312,8 +344,8 @@ A measurement can be committed a few milliseconds after the deactivation commit,
 
 **Rejected alternative: `SELECT ... FOR UPDATE` on the device row.** It closes the race, but it is an exclusive lock: concurrent ingestions of the same device queue up one after another.
 
-// see IA_LOG.md
 **Rejected alternative: `SELECT ... FOR SHARE` on the device row.** It closes the race without queueing ingestions: `FOR SHARE` is compatible with itself, so ingestions of the same device run concurrently, while the deactivation `UPDATE` (which takes `FOR NO KEY UPDATE`) waits for in-flight ingestions to finish. Ingestions arriving after the deactivation commit see `'inactive'` and are rejected. Cost: a lock on every ingestion, and a risk of starvation, since new share-lockers can keep joining while the `UPDATE` waits. Mitigations would be a `lock_timeout` on deactivation with retry, or falling back to `FOR UPDATE`. Not justified for a millisecond window.
+How this alternative was evaluated and rejected is described in `docs/AI_LOG.md`.
 
 **Why the FK alone does not close the race:** inserting a measurement takes `FOR KEY SHARE` on the device row (FK check), which does not conflict with `FOR NO KEY UPDATE`. Postgres allows updating non-key columns of a parent row while children are being inserted, so the status `UPDATE` is not blocked.
 
@@ -435,7 +467,13 @@ The constraint name is read from the driver error (`e.orig.diag.constraint_name`
 | A single measurement in a batch is invalid           | `207` if others succeeded, `422` if all failed | per item, in `results` | e.g. `unknown-type-unit`            |
 | Duplicate measurement (same id, same payload)        | `201 Created`                                  | per item: `duplicate`  | —                                   |
 | Same `device_measurement_id`, different payload      | `207` / `422` as above                         | per item: `rejected`   | `measurement-id-conflict`           |
+| No route matches the request path                    | `404 Not Found`                                | whole request          | `not-found`                         |
+| The route exists, but not for this HTTP method       | `405 Method Not Allowed` (+ `Allow` header)    | whole request          | `method-not-allowed`                |
+| Readiness check: the database is unreachable         | `503 Service Unavailable`                      | whole request          | `service-unavailable`               |
+| Unexpected error (a bug)                             | `500 Internal Server Error`                    | whole request          | `internal-error`                    |
 
+- **Route-level `not-found` is distinct from the domain types** `customer-not-found` and `device-not-found`: it means the URL matches no route, not that a resource is missing.
+- **`internal-error` reveals nothing:** a fixed `detail`, no stack trace and no database message. The error is logged once with its stack trace.
 - **Device-level errors apply to the whole request.** All measurements in a batch belong to the same device, so a missing or inactive device rejects the entire request with a single status and no per-item `results`.
 - **Two validation levels.** A malformed or schema-invalid body is rejected entirely with `422`. A measurement that is well-formed but cannot be stored is reported per item in `results` (see *Batches*), so the rest of the batch is still processed.
 - **Duplicates are a success.** The firmware only needs to know a measurement is stored so it can clear it from its buffer (see *Status codes*).
@@ -473,7 +511,7 @@ Content-Type: application/problem+json
 }
 ```
 
-**Validation errors** add an `errors` extension member, one entry per invalid field, located with a JSON Pointer (the pattern used in the RFC's own examples):
+**Validation errors** add an `errors` extension member, one entry per invalid field. Body fields are located with a JSON Pointer (`pointer`, the pattern used in the RFC's own examples), query and path parameters by name (`parameter`), the same split JSON:API uses:
 
 ```json
 HTTP/1.1 422 Unprocessable Content
@@ -483,11 +521,16 @@ Content-Type: application/problem+json
   "type": "https://api.kamleon.example/problems/validation-error",
   "title": "Request validation failed",
   "status": 422,
+  "instance": "/devices/9f2c4e1a-…/measurements",
   "errors": [
-    { "pointer": "#/measurements/3/timestamp", "detail": "Timestamp must include a UTC offset" }
+    { "pointer": "#/measurements/3/timestamp", "detail": "Input should have timezone info" }
   ]
 }
 ```
+
+- **`detail` is pydantic's default message**, not a custom one per field.
+- **The rejected value is never echoed:** pydantic's `input` field is left out of the response and the logs, since for measurements it is health data.
+- **Malformed JSON** points to the whole body (`"pointer": "#"`).
 
 **Rejected alternative: FastAPI's default error format.** It has two shapes (`{"detail": "text"}` for `HTTPException`, `{"detail": [...]}` for validation errors), so clients must check the type of `detail`. It also has no machine-readable identifier, so the conflicts that share `409` (`device-inactive`, `serial-already-registered`) could only be told apart by comparing message text. Fixing either requires custom exception handlers anyway, and at that point a standard format costs the same as an invented one.
 
@@ -545,6 +588,30 @@ Content-Type: application/problem+json
   - SQLite has no row-level locks (no `FOR SHARE`/`FOR UPDATE`; a write locks the whole database), so concurrency tests (simultaneous retries, duplicate registrations) would not test Postgres behavior.
   - SQLite has foreign keys disabled by default (`PRAGMA foreign_keys = ON`), so cascaded deletes and the `(type, unit)` composite FK would silently not be enforced.
   - It also has no `timestamptz` (dates stored as text/numbers, no time zone conversion) and different error details, so time-range queries and constraint-name error mapping would not be tested either.
+- **Test isolation: truncate after each test** (except `measurement_types`, which holds seeded data). Rejected: wrapping each test in a transaction that is rolled back. Concurrency tests need two separate connections that commit for real (A inserts and commits while B waits), which is impossible when the whole test runs inside a single transaction that never commits.
+
+- **Dependencies (closed list):** any dependency not listed here requires discussion before it is added (`AGENTS.md`, rule 8).
+  - **Runtime:**
+    - `fastapi`: web framework; brings pydantic and Starlette.
+    - `uvicorn[standard]`: ASGI server that runs the app in the container.
+    - `sqlalchemy[asyncio]`: ORM and statement API; the `asyncio` extra installs `greenlet`, required by the async engine.
+    - `psycopg[binary]`: psycopg 3 driver with a bundled libpq, so no system packages are needed locally or in the image.
+    - `alembic`: migrations.
+    - `pydantic-settings`: reads and validates configuration (`DATABASE_URL`) from the environment at startup.
+    - `email-validator`: required by pydantic's `EmailStr` to validate the customer email format.
+  - **Dev:**
+    - `pytest`: test runner.
+    - `httpx`: async test client (`AsyncClient` with `ASGITransport`), calling the app without starting a server.
+    - `ruff`: linting and formatting.
+  - **Rejected: `pytest-asyncio`.** Async tests use AnyIO's pytest plugin (`@pytest.mark.anyio`), which is already installed with Starlette and is the approach used in FastAPI's documentation. One dependency less.
+  - **Rejected: reading configuration directly with `os.environ`.** It works for a single variable, but values arrive as unvalidated strings scattered across modules. `pydantic-settings` keeps configuration in one typed class, validates formats (e.g. `DATABASE_URL` as a Postgres DSN) at startup, and is easy to override in tests.
+
+- **Versions:** Python 3.14 (`requires-python = ">=3.14"` in `pyproject.toml`) and PostgreSQL 18 (`postgres:18` image in `docker-compose`). Both are the current stable releases.
+  - **Python 3.14** is required: `measurements.id` is generated with `uuid.uuid7()`, which is in the standard library since 3.14. Older versions would need a third-party package.
+  - **PostgreSQL 18** is not required by the schema. No feature specific to 18 is used, and the database does not generate UUIDv7 values (see *Identifiers*), so the schema runs on any version with the `uuid` type. 18 is pinned only to have a reproducible setup.
+
+- **Migrations run as a separate one-shot step, not on API startup:** a `migrate` service in `docker-compose` runs `alembic upgrade head` once and exits; the API starts only after it completes successfully.
+  - **Rejected alternative: running migrations in the API entrypoint.** With several replicas starting at once, each would try to apply the same pending migration at the same time.
 
 ## Architecture
 

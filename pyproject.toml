@@ -1,0 +1,35 @@
+[project]
+name = "kamleon-challenge"
+version = "0.1.0"
+description = "REST API for customers, connected devices and their measurements"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic>=1.20.0",
+    "email-validator>=2.3.0",
+    "fastapi>=0.142.4",
+    "psycopg[binary]>=3.3.6",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy[asyncio]>=2.1.4",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.uv]
+# An application, not a library: dependencies only, the project itself is not built.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
