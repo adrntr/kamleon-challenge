@@ -124,7 +124,7 @@ CONSTRAINT measurements_type_unit_fkey
 
 --- 
 
-### Customer deletion
+## Customer deletion
 
 - **Assumption:** devices are not transferred between customers; the requirements state a device belongs to a single customer and don't mention resale. Reassigning a device would expose the previous owner's measurements to the new owner. **Future improvement:** store on each measurement the customer that owned the device at measurement time (copied from the device row read during ingestion) and filter reads by it.
 
@@ -141,7 +141,7 @@ Deleting a customer deletes their devices and all their measurements in a single
 
 ----
 
-### Indexes
+## Indexes
 
 **Main query:** measurements of one device, in a time range, optionally filtered by type, ordered by time.
 
@@ -242,7 +242,7 @@ A measurement is a fact that happened on the device, so its identity is created 
 INSERT INTO measurements (id, device_id, device_measurement_id, type, unit, value, "timestamp")
 VALUES (...)
 ON CONFLICT (device_id, device_measurement_id) DO NOTHING
-RETURNING id;
+RETURNING device_measurement_id;
 ```
 
 - **A row returned:** the measurement was created.
@@ -362,6 +362,17 @@ The constraint name is read from the driver error (`e.orig.diag.constraint_name`
 
 ## API contract
 
+### Resource layout: customers
+
+| Method | Route                      | Body                                                   | Responses                                                                                 |
+| ------ | -------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `POST` | `/customers`               | `{ "name": "Ana García", "email": "ana@kamleon.com" }` | `201` (+ `Location: /customers/{id}`), `409` email already registered, `422` invalid body |
+| `GET`  | `/customers/{customer_id}` | —                                                      | `200`, `404` customer not found                                                           |
+
+- **Email** is lowercased by the application before storing (see *Customer email*).
+- **No lookup by email:** the requirements only ask to create and retrieve customers. Unlike devices (a technician holding a device only has the serial on its label), there is no use case for finding a customer by email, and not exposing it avoids revealing which emails are registered.
+- **No delete endpoint:** the requirements ask to decide what happens when a customer is deleted, not to expose deletion. The behavior is defined in the schema (`ON DELETE CASCADE`, see *Customer deletion*). **Future improvement:** a `DELETE /customers/{id}` endpoint (with authentication) for GDPR erasure requests.
+
 ### Resource layout: devices
 
 **Decision: shallow nesting.** Creating and listing devices is nested under their customer; operating on a single device uses a flat route.
@@ -401,6 +412,15 @@ The constraint name is read from the driver error (`e.orig.diag.constraint_name`
 
 **When to revisit:** if transitions gain their own logic, e.g. a required deactivation reason, different permissions per transition, or side effects such as notifications. A single extra field such as a reason could still fit in the `PATCH` body if it is stored on the device. Different payloads, permissions and effects per transition would be better served by action routes, or by modeling the transition as a resource (`POST /devices/{id}/deactivations`, recording reason, time and author).
 
+### Measurement ingestion
+
+| Method | Route                               | Body                                                                                                                                            | Responses                                                                                                                                          |
+| ------ | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/devices/{device_id}/measurements` | `{ "measurements": [ { "device_measurement_id": "…", "type": "ph", "unit": "pH", "value": 7.41, "timestamp": "2026-10-06T09:00:00+02:00" } ] }` | `201` all created or duplicate, `207` mixed result, `422` invalid body or all measurements rejected, `404` device not found, `409` device inactive |
+
+- **Body is always a batch** (`measurements` array, 1 to 1000 items; more → `422`). A single measurement is a batch of one: one endpoint, one response format.
+- **Success responses (`201`, `207`)** return the batch result (`summary` + per-measurement `results`), see *Batches*.
+- **Device-level errors (`404`, `409`)** reject the whole request with problem details and no per-item results, see *Error mapping*.
 
 ### Error mapping
 
@@ -525,3 +545,11 @@ Content-Type: application/problem+json
   - SQLite has no row-level locks (no `FOR SHARE`/`FOR UPDATE`; a write locks the whole database), so concurrency tests (simultaneous retries, duplicate registrations) would not test Postgres behavior.
   - SQLite has foreign keys disabled by default (`PRAGMA foreign_keys = ON`), so cascaded deletes and the `(type, unit)` composite FK would silently not be enforced.
   - It also has no `timestamptz` (dates stored as text/numbers, no time zone conversion) and different error details, so time-range queries and constraint-name error mapping would not be tested either.
+
+## Architecture
+
+**Decision: layered architecture (router → service → repository) with a light domain layer.** Business rules are pure functions in `domain/` that receive plain values and have no FastAPI or SQLAlchemy imports, so they are testable without a database. Services orchestrate use cases with SQLAlchemy ORM models directly.
+
+- **Rejected alternative: full hexagonal architecture** (domain entities as dataclasses, repositories mapping rows to them, services never seeing ORM models). It removes all coupling to the ORM, but with three entities the mapping layer is more code than value for this scope.
+- **Trade-off accepted:** services depend on ORM models, so renaming a model attribute touches the services that use it.
+- **Evolution path:** if the domain grows (more rules, more entities, or a need to change persistence), introduce domain entities and make repositories map to them. The layering already allows it without touching routers.
