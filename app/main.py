@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.api import health
+from app.api import customers, health
 from app.api.problems import register_error_handlers
 from app.config import Settings, get_settings
 from app.db import create_engine
@@ -28,4 +28,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_error_handlers(app)
     app.include_router(health.router)
+    app.include_router(customers.router)
     return app

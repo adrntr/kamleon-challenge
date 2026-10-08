@@ -13,3 +13,13 @@ class DomainError(Exception):
 class DatabaseUnavailableError(DomainError):
     def __init__(self) -> None:
         super().__init__("The database is not reachable")
+
+
+class CustomerNotFoundError(DomainError):
+    def __init__(self, customer_id: object) -> None:
+        super().__init__(f"Customer {customer_id} does not exist")
+
+
+class EmailAlreadyRegisteredError(DomainError):
+    def __init__(self, email: str) -> None:
+        super().__init__(f"A customer with email {email} is already registered")

@@ -11,7 +11,12 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.domain.errors import DatabaseUnavailableError, DomainError
+from app.domain.errors import (
+    CustomerNotFoundError,
+    DatabaseUnavailableError,
+    DomainError,
+    EmailAlreadyRegisteredError,
+)
 from app.schemas.problem import ProblemDetails
 
 logger = logging.getLogger("app.errors")
@@ -39,6 +44,10 @@ INTERNAL_ERROR = ProblemType(500, "internal-error", "Internal server error")
 # The domain layer knows nothing about HTTP: statuses and problem types are assigned here.
 DOMAIN_PROBLEMS: dict[type[DomainError], ProblemType] = {
     DatabaseUnavailableError: ProblemType(503, "service-unavailable", "Service unavailable"),
+    CustomerNotFoundError: ProblemType(404, "customer-not-found", "Customer not found"),
+    EmailAlreadyRegisteredError: ProblemType(
+        409, "email-already-registered", "Email already registered"
+    ),
 }
 
 

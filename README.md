@@ -58,6 +58,26 @@ curl -i http://localhost:8000/health/ready
 # 503 application/problem+json if the database is unreachable
 ```
 
+### Customers
+
+Register a customer. The email is lowercased before storing.
+
+```bash
+curl -i -X POST http://localhost:8000/customers \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Ana García", "email": "ana@kamleon.com"}'
+# 201 + Location: /customers/{id}
+# 409 email-already-registered, 422 validation-error
+```
+
+Retrieve a customer.
+
+```bash
+curl -i http://localhost:8000/customers/{customer_id}
+# 200
+# 404 customer-not-found
+```
+
 ### Errors
 
 Every error response is an RFC 9457 problem details document (`application/problem+json`):
