@@ -1,7 +1,7 @@
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,3 +47,19 @@ async def list_by_serial_number(session: AsyncSession, serial_number: str) -> Se
     """Serials are unique, so the list has at most one device."""
     result = await session.scalars(select(Device).where(Device.serial_number == serial_number))
     return result.all()
+
+
+async def set_status(
+    session: AsyncSession, device_id: uuid.UUID, status: DeviceStatus
+) -> Device | None:
+    """Return the device if its status changed, None if it was already `status` or is missing.
+
+    IS DISTINCT FROM keeps updated_at untouched on a no-op (DECISIONS.md, Device status changes).
+    """
+    result = await session.execute(
+        update(Device)
+        .where(Device.id == device_id, Device.status.is_distinct_from(status))
+        .values(status=status)
+        .returning(Device)
+    )
+    return result.scalar_one_or_none()

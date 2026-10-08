@@ -441,6 +441,7 @@ The constraint name is read from the driver error (`e.orig.diag.constraint_name`
 - It is a "set status to X" operation, so it is idempotent and safe under concurrent requests and retries (see *Concurrent device status changes*).
 - A new status does not change the API: it only becomes a new accepted value. Action routes would need a new URL per state.
 - Only `status` is accepted in the body for now; no other device field is modifiable.
+- **`updated_at` changes only when the status actually changes.** The update is `UPDATE devices SET status = :status WHERE id = :id AND status IS DISTINCT FROM :status RETURNING ...`. If a row comes back, the status changed and that row is the response. If none comes back, the device is read by id: missing → `404 device-not-found`; present → `200` with the device unchanged (`updated_at` not touched). A no-op therefore never writes a new row version, and `updated_at` keeps meaning "last real modification".
 
 **Rejected alternative: action routes** (`POST /devices/{id}/activate`, `POST /devices/{id}/deactivate`). They are also "set status to X" and idempotent, so concurrency does not separate the two options. They also go against the REST convention that URLs name resources and the HTTP method expresses the action. That is a secondary argument: action routes are a widely accepted exception (e.g. Stripe's `POST /payment_intents/{id}/confirm`, Google's API design guide "custom methods" such as `POST /devices/{id}:deactivate`).
 
@@ -463,7 +464,7 @@ The constraint name is read from the driver error (`e.orig.diag.constraint_name`
 | Customer does not exist when registering a device    | `404 Not Found`                                | whole request          | `customer-not-found`                |
 | Serial number already registered                     | `409 Conflict`                                 | whole request          | `serial-already-registered`         |
 | Customer email already registered                    | `409 Conflict`                                 | whole request          | `email-already-registered`          |
-| Device does not exist (ingesting or `GET /devices/{id}`) | `404 Not Found`                            | whole request          | `device-not-found`                  |
+| Device does not exist (ingesting, `GET` or `PATCH /devices/{id}`) | `404 Not Found`                            | whole request          | `device-not-found`                  |
 | Device is inactive when ingesting                    | `409 Conflict`                                 | whole request          | `device-inactive`                   |
 | Request body is malformed or fails schema validation | `422 Unprocessable Content`                    | whole request          | `validation-error`                  |
 | A single measurement in a batch is invalid           | `207` if others succeeded, `422` if all failed | per item, in `results` | e.g. `unknown-type-unit`            |

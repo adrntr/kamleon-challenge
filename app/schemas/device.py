@@ -15,6 +15,15 @@ class DeviceCreate(BaseModel):
     )
 
 
+class DeviceStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: DeviceStatus = Field(
+        description="Target status. Setting the status a device already has is not an error.",
+        examples=["inactive"],
+    )
+
+
 class DeviceRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

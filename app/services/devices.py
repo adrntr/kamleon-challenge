@@ -3,6 +3,7 @@ from collections.abc import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.enums import DeviceStatus
 from app.domain.errors import CustomerNotFoundError, DeviceNotFoundError
 from app.models import Device
 from app.repositories import customers as customer_repository
@@ -22,6 +23,19 @@ async def register_device(
 async def get_device(session: AsyncSession, device_id: uuid.UUID) -> Device:
     async with session.begin():
         device = await device_repository.get(session, device_id)
+    if device is None:
+        raise DeviceNotFoundError(device_id)
+    return device
+
+
+async def set_device_status(
+    session: AsyncSession, device_id: uuid.UUID, status: DeviceStatus
+) -> Device:
+    """Set the target status. Idempotent: an already-current status returns the device untouched."""
+    async with session.begin():
+        device = await device_repository.set_status(session, device_id, status)
+        if device is None:
+            device = await device_repository.get(session, device_id)
     if device is None:
         raise DeviceNotFoundError(device_id)
     return device

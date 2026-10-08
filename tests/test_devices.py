@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 import pytest
 from httpx import AsyncClient
@@ -256,3 +257,70 @@ async def test_find_device_without_serial_returns_422(client: AsyncClient, param
 
     assert response.status_code == 422
     assert response.json()["errors"][0]["parameter"] == "serial_number"
+
+
+async def test_patch_status_change_updates_status_and_updated_at(client: AsyncClient) -> None:
+    device = await create_device(client, await create_customer(client))
+
+    response = await client.patch(f"/devices/{device['id']}", json={"status": "inactive"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "inactive"
+    assert body["id"] == device["id"]
+    assert body["created_at"] == device["created_at"]
+    assert datetime.fromisoformat(body["updated_at"]) > datetime.fromisoformat(device["updated_at"])
+    assert (await client.get(f"/devices/{device['id']}")).json() == body
+
+
+async def test_patch_same_status_is_noop_and_keeps_updated_at(client: AsyncClient) -> None:
+    device = await create_device(client, await create_customer(client))
+
+    response = await client.patch(f"/devices/{device['id']}", json={"status": "active"})
+
+    assert response.status_code == 200
+    assert response.json() == device
+
+    await client.patch(f"/devices/{device['id']}", json={"status": "inactive"})
+    changed = (await client.get(f"/devices/{device['id']}")).json()
+    repeated = await client.patch(f"/devices/{device['id']}", json={"status": "inactive"})
+    assert repeated.status_code == 200
+    assert repeated.json() == changed
+
+
+async def test_patch_unknown_device_returns_404(client: AsyncClient) -> None:
+    device_id = uuid.uuid4()
+
+    response = await client.patch(f"/devices/{device_id}", json={"status": "inactive"})
+
+    assert response.status_code == 404
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json() == {
+        "type": PROBLEMS + "device-not-found",
+        "title": "Device not found",
+        "status": 404,
+        "detail": f"Device {device_id} does not exist",
+        "instance": f"/devices/{device_id}",
+    }
+
+
+@pytest.mark.parametrize("body", [{"status": "broken"}, {"status": "Active"}, {}, {"status": None}])
+async def test_patch_invalid_status_returns_422(client: AsyncClient, body: dict) -> None:
+    device = await create_device(client, await create_customer(client))
+
+    response = await client.patch(f"/devices/{device['id']}", json=body)
+
+    assert response.status_code == 422
+    assert response.json()["type"] == PROBLEMS + "validation-error"
+
+
+async def test_patch_unknown_field_returns_422_and_changes_nothing(client: AsyncClient) -> None:
+    device = await create_device(client, await create_customer(client))
+
+    response = await client.patch(
+        f"/devices/{device['id']}", json={"status": "inactive", "serial_number": "X"}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["type"] == PROBLEMS + "validation-error"
+    assert (await client.get(f"/devices/{device['id']}")).json() == device

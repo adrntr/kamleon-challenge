@@ -106,6 +106,16 @@ curl -i http://localhost:8000/devices/{device_id}
 # 404 device-not-found
 ```
 
+Set the status of a device (`active` or `inactive`). Idempotent: setting the current status returns `200` and leaves `updated_at` unchanged.
+
+```bash
+curl -i -X PATCH http://localhost:8000/devices/{device_id} \
+  -H 'Content-Type: application/json' \
+  -d '{"status": "inactive"}'
+# 200 the device
+# 404 device-not-found, 422 validation-error
+```
+
 Find a device by serial number (the list is empty if none matches).
 
 ```bash

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Query, Response
 
 from app.api.dependencies import SessionDep
 from app.api.problems import PROBLEM_RESPONSE
-from app.schemas.device import DeviceCreate, DeviceList, DeviceRead
+from app.schemas.device import DeviceCreate, DeviceList, DeviceRead, DeviceStatusUpdate
 from app.services import devices as device_service
 
 customer_devices_router = APIRouter(prefix="/customers/{customer_id}/devices", tags=["devices"])
@@ -58,6 +58,21 @@ async def list_customer_devices(customer_id: uuid.UUID, session: SessionDep) -> 
 async def get_device(device_id: uuid.UUID, session: SessionDep) -> DeviceRead:
     """Retrieve a device by id."""
     device = await device_service.get_device(session, device_id)
+    return DeviceRead.model_validate(device)
+
+
+@router.patch(
+    "/{device_id}",
+    responses={
+        404: {**PROBLEM_RESPONSE, "description": "Device not found (device-not-found)"},
+        422: {**PROBLEM_RESPONSE, "description": "Invalid id or status (validation-error)"},
+    },
+)
+async def update_device_status(
+    device_id: uuid.UUID, body: DeviceStatusUpdate, session: SessionDep
+) -> DeviceRead:
+    """Set the status of a device. Idempotent: the current device is returned either way."""
+    device = await device_service.set_device_status(session, device_id, body.status)
     return DeviceRead.model_validate(device)
 
 
