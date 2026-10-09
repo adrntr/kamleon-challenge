@@ -2,6 +2,8 @@ import logging
 import uuid
 from collections import Counter
 from collections.abc import Sequence
+from datetime import datetime
+from typing import NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +24,11 @@ from app.repositories import devices as device_repository
 from app.repositories import measurements as measurement_repository
 
 logger = logging.getLogger(__name__)
+
+
+class MeasurementPage(NamedTuple):
+    items: Sequence[Measurement]
+    has_more: bool
 
 
 async def ingest_measurements(
@@ -52,6 +59,26 @@ async def ingest_measurements(
     if result.all_rejected:
         raise BatchRejectedError(result)
     return result
+
+
+async def list_measurements(
+    session: AsyncSession,
+    device_id: uuid.UUID,
+    *,
+    start: datetime,
+    end: datetime,
+    type_: str | None,
+    limit: int,
+) -> MeasurementPage:
+    """Measurements in [start, end), oldest first. One extra row tells whether the range
+    holds more than `limit`, with no COUNT (DECISIONS.md, Querying measurements)."""
+    async with session.begin():
+        if not await device_repository.exists(session, device_id):
+            raise DeviceNotFoundError(device_id)
+        rows = await measurement_repository.list_in_range(
+            session, device_id, start=start, end=end, type_=type_, limit=limit + 1
+        )
+    return MeasurementPage(items=rows[:limit], has_more=len(rows) > limit)
 
 
 async def _insert(

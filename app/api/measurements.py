@@ -1,20 +1,28 @@
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Query, Response
+from fastapi.exceptions import RequestValidationError
 
-from app.api.dependencies import SessionDep
+from app.api.dependencies import NowDep, SessionDep
 from app.api.problems import PROBLEM_MEDIA_TYPE, PROBLEM_RESPONSE
 from app.domain.measurements import ItemStatus, MeasurementPayload
 from app.schemas.measurement import (
     BatchRejectedProblem,
     MeasurementBatchCreate,
     MeasurementBatchRead,
+    MeasurementList,
+    MeasurementQuery,
+    MeasurementRead,
 )
 from app.schemas.problem import ProblemDetails
 from app.services import measurements as measurement_service
 
 router = APIRouter(prefix="/devices/{device_id}/measurements", tags=["measurements"])
+
+DEFAULT_RANGE = timedelta(hours=24)
 
 
 def _component_refs_schema(model: type[BatchRejectedProblem]) -> dict[str, Any]:
@@ -69,3 +77,62 @@ async def ingest_measurements(
     if result.count(ItemStatus.REJECTED):
         response.status_code = 207
     return MeasurementBatchRead.from_result(result)
+
+
+@dataclass(frozen=True)
+class MeasurementFilter:
+    start: datetime
+    end: datetime
+    type: str | None
+    limit: int
+
+
+def measurement_filter(
+    query: Annotated[MeasurementQuery, Query()], now: NowDep
+) -> MeasurementFilter:
+    """Apply the range defaults (to = now, from = to - 24h) and require from < to."""
+    end = query.to or now
+    start = query.from_ or end - DEFAULT_RANGE
+    if start >= end:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "from"),
+                    "msg": "from must be earlier than to",
+                }
+            ]
+        )
+    return MeasurementFilter(start=start, end=end, type=query.type, limit=query.limit)
+
+
+@router.get(
+    "",
+    responses={
+        404: {**PROBLEM_RESPONSE, "description": "Device not found (device-not-found)"},
+        422: {
+            **PROBLEM_RESPONSE,
+            "description": (
+                "Invalid id or query parameters, including from not earlier than to "
+                "(validation-error)"
+            ),
+        },
+    },
+)
+async def list_measurements(
+    device_id: uuid.UUID,
+    filter_: Annotated[MeasurementFilter, Depends(measurement_filter)],
+    session: SessionDep,
+) -> MeasurementList:
+    """Measurements of a device in [from, to), oldest first. has_more flags a truncated range."""
+    page = await measurement_service.list_measurements(
+        session,
+        device_id,
+        start=filter_.start,
+        end=filter_.end,
+        type_=filter_.type,
+        limit=filter_.limit,
+    )
+    return MeasurementList(
+        items=[MeasurementRead.model_validate(m) for m in page.items], has_more=page.has_more
+    )

@@ -137,6 +137,15 @@ curl -i -X POST http://localhost:8000/devices/{device_id}/measurements \
 # 404 device-not-found, 409 device-inactive, 422 validation-error
 ```
 
+Query a device's measurements in the half-open range `[from, to)`, oldest first. Without `from`/`to`, the last 24 hours; `type` and `limit` (default 1000, max 5000) are optional.
+
+```bash
+curl -i 'http://localhost:8000/devices/{device_id}/measurements?type=ph&from=2026-10-06T00:00:00Z&to=2026-10-07T00:00:00Z&limit=1000'
+# 200 {"items": [{"id": "...", "device_measurement_id": "...", "type": "ph", "value": 7.41, "unit": "pH", "timestamp": "2026-10-06T07:00:00Z"}], "has_more": false}
+# 404 device-not-found
+# 422 validation-error (from/to without a UTC offset, from not earlier than to, limit out of range)
+```
+
 ### Errors
 
 Every error response is an RFC 9457 problem details document (`application/problem+json`):

@@ -363,6 +363,8 @@ Content-Type: application/problem+json
 - **Unregistered `(type, unit)` pairs are detected before inserting:** the batch's distinct pairs are read from `measurement_types` in one query, and measurements with an unknown pair are rejected without an `INSERT`. Inside one transaction, an FK violation would abort the rest of the batch. `measurements_type_unit_fkey` stays the guarantee: a pair removed concurrently makes the `INSERT` fail and the request return `500`, since removing a pair in use is a migration step, not a runtime event. Consequence: an existing `device_measurement_id` sent with an unregistered pair is reported as `unknown-type-unit`, not `measurement-id-conflict`.
 - **Duplicate or conflict:** the stored row is compared with the incoming measurement on `type`, `unit`, `value` and `timestamp`. Timestamps are compared as instants (`09:00+02:00` equals `07:00Z`; the offset is not stored). Values are compared exactly, with no tolerance: `double precision` round-trips the float the device sent, so a genuine retry is always bit-identical.
 - **Logging:** the service logs non-created outcomes aggregated per batch, one line per `(outcome, type, unit)` with the count and the `device_id`, never the values: `duplicate` at `info`, `measurement-id-conflict` and `unknown-type-unit` at `warning`. Rejections are logged with the same problem type identifiers as `results[].error.type`, so logs and responses can be searched and alerted on with the same string. A misconfigured firmware sending 1000 bad measurements logs one line, not 1000. A `422 batch-rejected` is additionally logged once by the global handler, since it records a different fact (the request outcome).
+- **Batch size limit: 1000 measurements.** It bounds the request size (~180 KB) and the duration of the ingestion transaction, and covers about 5 hours of a device offline at 3 measurements per minute; longer backlogs are sent as several batches. It also stays far below PostgreSQL's limit of 65,535 bind parameters per statement (7 per row, so about 9,300 rows at most). Starting values, to be tuned with real batch sizes and latencies.
+
 
 ## Concurrency
 
@@ -587,9 +589,10 @@ Problem types live under `https://api.kamleon.example/problems/`.
 
 #### Measurement query: `GET /devices/{device_id}/measurements`
 
-| Case                  | Status          | Problem `type`     |
-| --------------------- | --------------- | ------------------ |
-| Device does not exist | `404 Not Found` | `device-not-found` |
+| Case                                                                                   | Status                                      | Problem `type`     |
+| -------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------ |
+| Device does not exist                                                                  | `404 Not Found`                             | `device-not-found` |
+| `from`/`to` without a UTC offset, `from` not earlier than `to`, `limit` outside 1–5000 | `422 Unprocessable Content` (with `errors`) | `validation-error` |
 
 #### Health: `GET /health/ready`
 
@@ -689,7 +692,7 @@ Content-Type: application/problem+json
 ```
 
 - **Half-open interval `[from, to)`:** consecutive windows (`[00:00, 01:00)`, `[01:00, 02:00)`) never overlap or leave gaps, so no measurement is returned twice or skipped. A closed interval would also force awkward bounds like `to=23:59:59`, missing measurements at `23:59:59.500`.
-- **Default range:** `from` defaults to `to - 24h` and `to` defaults to now, so a request without parameters returns the last day. `from` must be earlier than `to`, otherwise `422`. Both must include a UTC offset, same as measurement timestamps.
+- **Default range:** `from` defaults to `to - 24h` and `to` defaults to now, so a request without parameters returns the last day. `from` must be earlier than `to` (after applying the defaults), otherwise `422 validation-error` with `errors[].parameter` = `from`. Both must include a UTC offset, same as measurement timestamps. "Now" comes from a FastAPI dependency (`get_now`), so tests fix it with `app.dependency_overrides`.
 - **Ordering:** ascending by `timestamp`, served directly by the `(device_id, "timestamp", type)` index without sorting.
 - **`limit`:** default `1000`, maximum `5000` (larger values → `422`). A measurement is about 150–200 bytes of JSON, so 5000 rows is about 1 MB per response. A device measuring 3 types once a minute produces about 4,300 measurements per day, so the maximum covers a full day in one request.
 - **Truncation is explicit:** if the range contains more rows than `limit`, the first `limit` rows are returned with `"has_more": true`. It is computed by querying `limit + 1` rows, with no extra count query. Without it, a client would assume it received all the data.

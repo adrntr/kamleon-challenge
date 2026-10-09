@@ -1,5 +1,6 @@
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
+from datetime import datetime
 
 from sqlalchemy import select, tuple_
 from sqlalchemy.dialects.postgresql import insert
@@ -79,3 +80,25 @@ async def get_by_device_measurement_ids(
         )
     )
     return {m.device_measurement_id: m for m in result}
+
+
+async def list_in_range(
+    session: AsyncSession,
+    device_id: uuid.UUID,
+    *,
+    start: datetime,
+    end: datetime,
+    type_: str | None,
+    limit: int,
+) -> Sequence[Measurement]:
+    """Measurements in [start, end), oldest first, read in order from
+    measurements_device_id_timestamp_type_idx (DECISIONS.md, Indexes)."""
+    statement = select(Measurement).where(
+        Measurement.device_id == device_id,
+        Measurement.timestamp >= start,
+        Measurement.timestamp < end,
+    )
+    if type_ is not None:
+        statement = statement.where(Measurement.type == type_)
+    result = await session.scalars(statement.order_by(Measurement.timestamp).limit(limit))
+    return result.all()
