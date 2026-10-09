@@ -8,6 +8,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import Engine, text
 
+from app.repositories import measurements as measurement_repository
 from app.schemas.measurement import ITEM_PROBLEM_TYPES, ItemProblemType
 from tests.support import request_during_uncommitted_insert
 
@@ -68,6 +69,31 @@ def stored_params(device_id: str, item: dict) -> dict:
         "value": item["value"],
         "timestamp": datetime.fromisoformat(item["timestamp"]),
     }
+
+
+def store(db: Engine, device_id: str, item: dict, **overrides: object) -> None:
+    with db.begin() as connection:
+        connection.execute(text(INSERT_MEASUREMENT), stored_params(device_id, item) | overrides)
+
+
+def delete_before_read_back(
+    monkeypatch: pytest.MonkeyPatch, db: Engine, statement: str, params: dict
+) -> None:
+    """Force a deletion between the conflicting INSERT and the read-back SELECT.
+
+    The ingestion transaction runs at READ COMMITTED, so the SELECT sees a deletion
+    committed on another connection just before it runs.
+    """
+    read_back = measurement_repository.get_by_device_measurement_ids
+
+    async def delete_then_read_back(*args: object, **kwargs: object):
+        with db.begin() as connection:
+            connection.execute(text(statement), params)
+        return await read_back(*args, **kwargs)
+
+    monkeypatch.setattr(
+        measurement_repository, "get_by_device_measurement_ids", delete_then_read_back
+    )
 
 
 def summary(created: int = 0, duplicate: int = 0, rejected: int = 0) -> dict:
@@ -227,6 +253,62 @@ async def test_mixed_batch_returns_207_with_results_in_request_order(
     }
     [row] = stored_rows(db)
     assert str(row.device_measurement_id) == valid["device_measurement_id"]
+
+
+async def test_batch_with_a_stored_measurement_in_the_middle(
+    client: AsyncClient, db: Engine
+) -> None:
+    """RETURNING yields only A and C: B must be matched by id, not by position."""
+    device_id = await create_device(client)
+    a, b, c = measurement(), measurement(), measurement()
+    store(db, device_id, b)
+
+    response = await ingest(client, device_id, a, b, c)
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "summary": summary(created=2, duplicate=1),
+        "results": [
+            {"device_measurement_id": a["device_measurement_id"], "status": "created"},
+            {"device_measurement_id": b["device_measurement_id"], "status": "duplicate"},
+            {"device_measurement_id": c["device_measurement_id"], "status": "created"},
+        ],
+    }
+    assert len(stored_rows(db)) == 3
+
+
+async def test_batch_of_50_mixing_every_outcome(client: AsyncClient, db: Engine) -> None:
+    device_id = await create_device(client)
+    batch, expected = [], []
+    for index in range(50):
+        item = measurement(value=float(index))
+        match index % 4:
+            case 0:
+                expected.append("created")
+            case 1:
+                store(db, device_id, item)
+                expected.append("duplicate")
+            case 2:
+                store(db, device_id, item, value=-1.0)
+                expected.append("measurement-id-conflict")
+            case 3:
+                item |= {"type": "current", "unit": "MA"}
+                expected.append("unknown-type-unit")
+        batch.append(item)
+
+    response = await ingest(client, device_id, *batch)
+
+    assert response.status_code == 207
+    body = response.json()
+    assert body["summary"] == summary(created=13, duplicate=13, rejected=24)
+    assert [r["device_measurement_id"] for r in body["results"]] == [
+        item["device_measurement_id"] for item in batch
+    ]
+    assert [
+        r["error"]["type"].removeprefix(PROBLEMS) if r["status"] == "rejected" else r["status"]
+        for r in body["results"]
+    ] == expected
+    assert len(stored_rows(db)) == 13 + 13 + 12
 
 
 async def test_unregistered_type_unit_pair_is_rejected(client: AsyncClient, db: Engine) -> None:
@@ -465,3 +547,48 @@ async def test_device_deleted_during_ingestion_returns_404(client: AsyncClient, 
     assert response.json()["type"] == PROBLEMS + "device-not-found"
     assert "measurements_device_id_fkey" not in response.text
     assert stored_rows(db) == []
+
+
+async def test_device_deleted_before_read_back_returns_404(
+    client: AsyncClient, db: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device_id = await create_device(client)
+    item = measurement()
+    store(db, device_id, item)
+    delete_before_read_back(
+        monkeypatch, db, "DELETE FROM devices WHERE id = :id", {"id": device_id}
+    )
+
+    response = await ingest(client, device_id, item)
+
+    assert response.status_code == 404
+    assert response.json()["type"] == PROBLEMS + "device-not-found"
+    assert stored_rows(db) == []
+
+
+async def test_measurement_removed_outside_the_model_returns_500_and_is_not_reinserted(
+    client: AsyncClient,
+    db: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    device_id = await create_device(client)
+    item = measurement(value=123.456)
+    store(db, device_id, item)
+    delete_before_read_back(
+        monkeypatch,
+        db,
+        "DELETE FROM measurements WHERE device_measurement_id = :id",
+        {"id": item["device_measurement_id"]},
+    )
+
+    response = await ingest(client, device_id, item)
+
+    assert response.status_code == 500
+    assert response.json()["type"] == PROBLEMS + "internal-error"
+    assert stored_rows(db) == []
+    [record] = [r for r in caplog.records if r.name == "app.errors"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    assert "missing from the read-back" in str(record.exc_info[1])
+    assert "123.456" not in caplog.text

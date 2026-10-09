@@ -28,28 +28,33 @@ async def registered_pairs(
 
 async def insert_if_absent(
     session: AsyncSession,
-    *,
-    measurement_id: uuid.UUID,
     device_id: uuid.UUID,
-    measurement: MeasurementPayload,
-) -> bool:
-    """Insert unless (device_id, device_measurement_id) exists. True if a row was inserted.
+    measurements: Collection[MeasurementPayload],
+) -> set[uuid.UUID]:
+    """Insert every measurement whose (device_id, device_measurement_id) is absent, in one
+    statement. Returns the device_measurement_ids actually inserted.
 
-    The conflict target is explicit so that a violation of any other unique
-    constraint still raises (DECISIONS.md, Concurrent retries). If another
-    transaction holds an uncommitted row with the same key, this waits for it.
+    RETURNING yields only inserted rows, in no guaranteed order, so callers match by id.
+    The conflict target is explicit so that a violation of any other unique constraint
+    still raises (DECISIONS.md, Concurrent retries). If another transaction holds an
+    uncommitted row with the same key, this waits for it. Rows are sent sorted by id so
+    that concurrent batches sharing ids take their locks in the same order.
     """
+    rows = [
+        {
+            "id": uuid.uuid7(),
+            "device_id": device_id,
+            "device_measurement_id": m.device_measurement_id,
+            "type": m.type,
+            "unit": m.unit,
+            "value": m.value,
+            "timestamp": m.timestamp,
+        }
+        for m in sorted(measurements, key=lambda m: m.device_measurement_id)
+    ]
     statement = (
         insert(Measurement)
-        .values(
-            id=measurement_id,
-            device_id=device_id,
-            device_measurement_id=measurement.device_measurement_id,
-            type=measurement.type,
-            unit=measurement.unit,
-            value=measurement.value,
-            timestamp=measurement.timestamp,
-        )
+        .values(rows)
         .on_conflict_do_nothing(index_elements=["device_id", "device_measurement_id"])
         .returning(Measurement.device_measurement_id)
     )
@@ -60,15 +65,17 @@ async def insert_if_absent(
         if getattr(e.orig.diag, "constraint_name", None) == "measurements_device_id_fkey":  # type: ignore[union-attr]
             raise DeviceNotFoundError(device_id) from e
         raise
-    return result.scalar_one_or_none() is not None
+    return set(result.scalars())
 
 
-async def get_by_device_measurement_id(
-    session: AsyncSession, device_id: uuid.UUID, device_measurement_id: uuid.UUID
-) -> Measurement | None:
-    return await session.scalar(
+async def get_by_device_measurement_ids(
+    session: AsyncSession, device_id: uuid.UUID, device_measurement_ids: Collection[uuid.UUID]
+) -> dict[uuid.UUID, Measurement]:
+    """The stored measurements among `device_measurement_ids`, keyed by that id."""
+    result = await session.scalars(
         select(Measurement).where(
             Measurement.device_id == device_id,
-            Measurement.device_measurement_id == device_measurement_id,
+            Measurement.device_measurement_id.in_(list(device_measurement_ids)),
         )
     )
+    return {m.device_measurement_id: m for m in result}

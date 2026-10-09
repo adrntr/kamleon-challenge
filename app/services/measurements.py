@@ -43,13 +43,10 @@ async def ingest_measurements(
         registered = await measurement_repository.registered_pairs(
             session, {(m.type, m.unit) for m in measurements}
         )
-        items = []
-        for measurement in measurements:
-            if (measurement.type, measurement.unit) not in registered:
-                items.append(_rejected(measurement, unknown_type_unit(measurement)))
-            else:
-                items.append(await _store(session, device_id, measurement))
-    result = BatchResult(tuple(items))
+        insertable = [m for m in measurements if (m.type, m.unit) in registered]
+        inserted = await _insert(session, device_id, insertable)
+        stored = await _read_back(session, device_id, insertable, inserted)
+    result = BatchResult(tuple(_classify(m, registered, inserted, stored) for m in measurements))
 
     _log_outcomes(device_id, measurements, result)
     if result.all_rejected:
@@ -57,23 +54,51 @@ async def ingest_measurements(
     return result
 
 
-async def _store(
-    session: AsyncSession, device_id: uuid.UUID, measurement: MeasurementPayload
-) -> ItemResult:
-    """Insert and let the unique constraint decide; read the stored row only on conflict."""
-    inserted = await measurement_repository.insert_if_absent(
-        session, measurement_id=uuid.uuid7(), device_id=device_id, measurement=measurement
-    )
-    if inserted:
-        return ItemResult(measurement.device_measurement_id, ItemStatus.CREATED)
+async def _insert(
+    session: AsyncSession, device_id: uuid.UUID, measurements: Sequence[MeasurementPayload]
+) -> set[uuid.UUID]:
+    """One INSERT for the batch; the unique constraint decides which rows are new."""
+    if not measurements:
+        return set()
+    return await measurement_repository.insert_if_absent(session, device_id, measurements)
 
-    stored = await measurement_repository.get_by_device_measurement_id(
-        session, device_id, measurement.device_measurement_id
+
+async def _read_back(
+    session: AsyncSession,
+    device_id: uuid.UUID,
+    measurements: Sequence[MeasurementPayload],
+    inserted: set[uuid.UUID],
+) -> dict[uuid.UUID, Measurement]:
+    """One SELECT for every id the INSERT skipped, to tell duplicates from conflicts."""
+    existing = {m.device_measurement_id for m in measurements} - inserted
+    if not existing:
+        return {}
+    stored = await measurement_repository.get_by_device_measurement_ids(
+        session, device_id, existing
     )
-    if stored is None:
-        # Measurements are only deleted by cascade, so the device was deleted meanwhile.
-        raise DeviceNotFoundError(device_id)
-    if is_same_measurement(_payload(stored), measurement):
+    if stored.keys() != existing:
+        # Deleted between the INSERT and this SELECT (DECISIONS.md, Ingestion vs. deletion).
+        if not await device_repository.exists(session, device_id):
+            raise DeviceNotFoundError(device_id)
+        # Removed outside the model; never re-inserted, the deletion may be deliberate.
+        raise RuntimeError(
+            f"device {device_id}: {len(existing - stored.keys())} measurement(s) skipped by "
+            "the INSERT as existing are missing from the read-back"
+        )
+    return stored
+
+
+def _classify(
+    measurement: MeasurementPayload,
+    registered: set[tuple[str, str]],
+    inserted: set[uuid.UUID],
+    stored: dict[uuid.UUID, Measurement],
+) -> ItemResult:
+    if (measurement.type, measurement.unit) not in registered:
+        return _rejected(measurement, unknown_type_unit(measurement))
+    if measurement.device_measurement_id in inserted:
+        return ItemResult(measurement.device_measurement_id, ItemStatus.CREATED)
+    if is_same_measurement(_payload(stored[measurement.device_measurement_id]), measurement):
         return ItemResult(measurement.device_measurement_id, ItemStatus.DUPLICATE)
     return _rejected(measurement, measurement_id_conflict(measurement))
 

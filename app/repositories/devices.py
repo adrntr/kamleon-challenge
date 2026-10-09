@@ -34,6 +34,12 @@ async def get(session: AsyncSession, device_id: uuid.UUID) -> Device | None:
     return await session.get(Device, device_id)
 
 
+async def exists(session: AsyncSession, device_id: uuid.UUID) -> bool:
+    """Always queries the database, unlike `get`, which may answer from the identity map."""
+    found = await session.scalar(select(Device.id).where(Device.id == device_id))
+    return found is not None
+
+
 async def list_by_customer(session: AsyncSession, customer_id: uuid.UUID) -> Sequence[Device]:
     result = await session.scalars(
         select(Device)
