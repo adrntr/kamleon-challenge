@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.api import customers, devices, health
+from app.api import customers, devices, health, measurements
 from app.api.problems import register_error_handlers
 from app.config import Settings, get_settings
 from app.db import create_engine
@@ -31,4 +31,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(customers.router)
     app.include_router(devices.customer_devices_router)
     app.include_router(devices.router)
+    app.include_router(measurements.router)
     return app

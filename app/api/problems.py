@@ -12,18 +12,20 @@ from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.domain.errors import (
+    BatchRejectedError,
     CustomerNotFoundError,
     DatabaseUnavailableError,
+    DeviceInactiveError,
     DeviceNotFoundError,
     DomainError,
     EmailAlreadyRegisteredError,
     SerialAlreadyRegisteredError,
 )
-from app.schemas.problem import ProblemDetails
+from app.schemas.measurement import MeasurementBatchRead
+from app.schemas.problem import PROBLEM_TYPE_BASE, ProblemDetails
 
 logger = logging.getLogger("app.errors")
 
-PROBLEM_TYPE_BASE = "https://api.kamleon.example/problems/"
 PROBLEM_MEDIA_TYPE = "application/problem+json"
 # For `responses=` in routes. The schema is inlined because FastAPI's "model" key
 # documents it under application/json instead of application/problem+json.
@@ -53,6 +55,10 @@ DOMAIN_PROBLEMS: dict[type[DomainError], ProblemType] = {
     DeviceNotFoundError: ProblemType(404, "device-not-found", "Device not found"),
     SerialAlreadyRegisteredError: ProblemType(
         409, "serial-already-registered", "Serial number already registered"
+    ),
+    DeviceInactiveError: ProblemType(409, "device-inactive", "Device is inactive"),
+    BatchRejectedError: ProblemType(
+        422, "batch-rejected", "All measurements in the batch were rejected"
     ),
 }
 
@@ -132,7 +138,18 @@ async def handle_domain_error(request: Request, exc: DomainError) -> JSONRespons
         )
     else:
         _log_one_line(request, problem, exc.detail, exc)
-    return problem_response(problem, request.url.path, detail=exc.detail)
+    return problem_response(
+        problem, request.url.path, detail=exc.detail, extensions=_domain_extensions(exc)
+    )
+
+
+def _domain_extensions(exc: DomainError) -> dict[str, Any] | None:
+    if isinstance(exc, BatchRejectedError):
+        # The same summary and results as a 201/207 body (DECISIONS.md, Batches).
+        return MeasurementBatchRead.from_result(exc.result).model_dump(
+            mode="json", exclude_none=True
+        )
+    return None
 
 
 def _escape_pointer_token(token: Any) -> str:

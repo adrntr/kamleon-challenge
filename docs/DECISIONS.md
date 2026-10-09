@@ -291,9 +291,16 @@ RETURNING device_measurement_id;
 
 **Decision: partial processing with a result per measurement.** Valid measurements are stored even if others in the same batch fail. With all-or-nothing, a single invalid measurement (typically a firmware bug that retries cannot fix) would block every valid measurement in the batch on every retry.
 
+A batch has 1 to 1000 measurements; more is a schema validation error (`422 validation-error`).
+
+**Mixed result (`207`):**
+
 ```json
+HTTP/1.1 207 Multi-Status
+Content-Type: application/json
+
 {
-  "summary": { "received": 50, "created": 47, "duplicate": 2, "rejected": 1 },
+  "summary": { "received": 3, "created": 1, "duplicate": 1, "rejected": 1 },
   "results": [
     { "device_measurement_id": "0192a7c4-0001-...", "status": "created" },
     { "device_measurement_id": "0192a7c4-0002-...", "status": "duplicate" },
@@ -309,14 +316,46 @@ RETURNING device_measurement_id;
 }
 ```
 
+**Every measurement rejected (`422`):**
+
+```json
+HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.kamleon.example/problems/batch-rejected",
+  "title": "All measurements in the batch were rejected",
+  "status": 422,
+  "detail": "1 of 1 measurements were rejected",
+  "instance": "/devices/9f2c4e1a-.../measurements",
+  "summary": { "received": 1, "created": 0, "duplicate": 0, "rejected": 1 },
+  "results": [
+    {
+      "device_measurement_id": "0192a7c4-0003-...",
+      "status": "rejected",
+      "error": {
+        "type": "https://api.kamleon.example/problems/unknown-type-unit",
+        "detail": "Unit 'MA' is not registered for type 'current'"
+      }
+    }
+  ]
+}
+```
+
 - **`results`** has one entry per measurement, in request order, identified by `device_measurement_id` (its identity), not by position.
 - **`status`** is a closed set: `created`, `duplicate`, `rejected`.
-- **`error.type`** uses the same problem type URIs as whole-request errors (RFC 9457), so per-item and request-level errors share one vocabulary and can be counted and alerted on by type; **`detail`** is for humans.
+- **`error`** on a rejected entry reuses two RFC 9457 fields: `type`, with the same problem type URIs as request-level errors, so per-item and request-level errors share one vocabulary and can be counted and alerted on by type; and `detail`, for humans. It is not a full problem details document.
 - **Firmware rule:** `created` and `duplicate` mean "stored, remove from buffer"; `rejected` means "do not retry". A rejected measurement almost always means a firmware bug, so it is logged and alerted on instead of being retried.
-- **HTTP status:** all created or duplicate → `201`; all rejected → `422`; mixed → `207 Multi-Status`. Rejected alternative for the mixed case: `200` with per-item results. Both are 2xx, so clients treat them as success either way, but `207` makes partial batches visible in access logs and status-code metrics without inspecting response bodies. `207` comes from WebDAV, where its body is XML; using it with a JSON body is a common convention in REST APIs.
+- **HTTP status:** all created or duplicate → `201`; mixed → `207 Multi-Status`; all rejected → `422`.
+  - **`201` and `207` are success responses** (`application/json`). Rejected alternative for the mixed case: `200` with per-item results. Both are 2xx, so clients treat them as success either way, but `207` makes partial batches visible in access logs and status-code metrics without inspecting response bodies. `207` comes from WebDAV, where its body is XML; using it with a JSON body is a common convention in REST APIs.
+  - **`422` is an error response**, so it is RFC 9457 problem details (`application/problem+json`) with type `batch-rejected`, and carries the same `summary` and `results` as extension members.
+- **One result structure for every outcome.** A rejected measurement's `results` entry is identical whether the batch ends in `207` or `422`; only the envelope changes, and it describes the batch, not the measurement. Firmware processes `results` with the same code for `201`, `207` and `422`. Rejected alternative: a `422` whose top-level `type` is the reason (e.g. `unknown-type-unit`) and without `results`. The same rejection would then look different depending on whether other measurements in the batch were accepted, and a batch rejected for several reasons could not be described.
 - **Implementation:** the batch is inserted with a single multi-row `INSERT ... ON CONFLICT DO NOTHING RETURNING device_measurement_id`. `RETURNING` yields one row per row actually inserted; conflicting rows yield nothing. The ids missing from the result are the ones that already existed, and only those are read back and compared to classify them as `duplicate` or `rejected`.
-
-
+- **Repeated `device_measurement_id` within a batch → `422 validation-error`** for the whole request, located at the second occurrence (`#/measurements/N/device_measurement_id`). It is detectable from the body alone, so it belongs to schema validation (see *Two validation levels*); it violates the firmware contract (ids are unique per device), so it signals a firmware bug; and `results` identifies measurements by id, so two entries with the same id would be ambiguous for the firmware clearing its buffer. Rejected alternative: processing them in order (the first created, the second classified against it as `duplicate` or `measurement-id-conflict`), which leaves two `results` entries with the same id.
+- **Non-finite values (`NaN`, `Infinity`) → `422 validation-error`** for the whole request. They are not valid JSON (RFC 8259) and are not measurements: they usually come from a disconnected sensor or a division by zero in the firmware. They would also break idempotency, since `NaN != NaN` and a retry would be reported as `measurement-id-conflict` instead of `duplicate`. A device without a reading should omit the measurement.
+- **Unregistered `(type, unit)` pairs are detected before inserting:** the batch's distinct pairs are read from `measurement_types` in one query, and measurements with an unknown pair are rejected without an `INSERT`. Inside one transaction, an FK violation would abort the rest of the batch. `measurements_type_unit_fkey` stays the guarantee: a pair removed concurrently makes the `INSERT` fail and the request return `500`, since removing a pair in use is a migration step, not a runtime event. Consequence: an existing `device_measurement_id` sent with an unregistered pair is reported as `unknown-type-unit`, not `measurement-id-conflict`.
+- **Duplicate or conflict:** the stored row is compared with the incoming measurement on `type`, `unit`, `value` and `timestamp`. Timestamps are compared as instants (`09:00+02:00` equals `07:00Z`; the offset is not stored). Values are compared exactly, with no tolerance: `double precision` round-trips the float the device sent, so a genuine retry is always bit-identical.
+- **Logging:** the service logs non-created outcomes aggregated per batch, one line per `(outcome, type, unit)` with the count and the `device_id`, never the values: `duplicate` at `info`, `measurement-id-conflict` and `unknown-type-unit` at `warning`. Rejections are logged with the same problem type identifiers as `results[].error.type`, so logs and responses can be searched and alerted on with the same string. A misconfigured firmware sending 1000 bad measurements logs one line, not 1000. A `422 batch-rejected` is additionally logged once by the global handler, since it records a different fact (the request outcome).
 
 ## Concurrency
 
@@ -351,6 +390,14 @@ How this alternative was evaluated and rejected is described in `docs/AI_LOG.md`
 
 **Revisit if** a strict guarantee is required ("no measurement is accepted after the deactivation commit"): use `FOR SHARE` in ingestion plus a `lock_timeout` on deactivation.
 
+
+### Ingestion vs. device deletion
+
+A device can be deleted while one of its batches is being ingested (cascade from a customer deletion, see *Customer deletion*). **Decision: the request returns `404 device-not-found`**, the same response as if the device had been missing when the request arrived. Two interleavings reach it:
+- **The deletion commits before an `INSERT`:** the `INSERT` violates `measurements_device_id_fkey`, which the repository maps to `device-not-found` by constraint name.
+- **The deletion commits between a conflicting `INSERT` and the read-back of the stored row:** the row is gone. Measurements are only deleted by cascade from their device, so a missing row means the device no longer exists.
+
+The transaction is rolled back, so nothing from the batch is stored, consistent with a device-level error rejecting the whole request. Once the request has inserted a row, it holds `FOR KEY SHARE` on the device (FK check), so a deletion waits for the ingestion to finish instead of interleaving.
 
 ### Concurrent device status changes
 
@@ -449,43 +496,117 @@ The constraint name is read from the driver error (`e.orig.diag.constraint_name`
 
 ### Measurement ingestion
 
-| Method | Route                               | Body                                                                                                                                            | Responses                                                                                                                                          |
-| ------ | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/devices/{device_id}/measurements` | `{ "measurements": [ { "device_measurement_id": "…", "type": "ph", "unit": "pH", "value": 7.41, "timestamp": "2026-10-06T09:00:00+02:00" } ] }` | `201` all created or duplicate, `207` mixed result, `422` invalid body or all measurements rejected, `404` device not found, `409` device inactive |
+| Method | Route                               | Body                          | Responses                                                                                                                                                                                  |
+| ------ | ----------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST` | `/devices/{device_id}/measurements` | batch of measurements (below) | `201` all created or duplicate, `207` mixed result, `422` `batch-rejected` all measurements rejected, `422` `validation-error` invalid body, `404` device not found, `409` device inactive |
 
-- **Body is always a batch** (`measurements` array, 1 to 1000 items; more → `422`). A single measurement is a batch of one: one endpoint, one response format.
-- **Success responses (`201`, `207`)** return the batch result (`summary` + per-measurement `results`), see *Batches*.
-- **Device-level errors (`404`, `409`)** reject the whole request with problem details and no per-item results, see *Error mapping*.
+```json
+{
+  "measurements": [
+    {
+      "device_measurement_id": "0192a7c4-0001-7a3e-8b1f-3c2d4e5f6a70",
+      "type": "ph",
+      "unit": "pH",
+      "value": 7.41,
+      "timestamp": "2026-10-06T09:00:00+02:00"
+    },
+    {
+      "device_measurement_id": "0192a7c4-0002-7a3e-8b1f-3c2d4e5f6a71",
+      "type": "temperature",
+      "unit": "degC",
+      "value": 36.6,
+      "timestamp": "2026-10-06T09:00:00+02:00"
+    },
+    {
+      "device_measurement_id": "0192a7c4-0003-7a3e-8b1f-3c2d4e5f6a72",
+      "type": "ph",
+      "unit": "pH",
+      "value": 7.38,
+      "timestamp": "2026-10-06T09:01:00+02:00"
+    }
+  ]
+}
+```
+
+- **Body is always a batch** (`measurements` array, 1 to 1000 items; more → `422 validation-error`). A single measurement is a batch of one: one endpoint, one response format.
+- **Batch responses (`201`, `207`, and `422 batch-rejected`)** return the batch result (`summary` + per-measurement `results`), see *Batches*. `201` and `207` are success responses (`application/json`); `422 batch-rejected` is problem details with `summary` and `results` as extension members.
+- **Request-level errors (`422 validation-error`, `404`, `409`)** reject the whole request with problem details and no per-item `results`, see *Error mapping*.
 
 ### Error mapping
 
-| Case                                                 | Status                                         | Scope                  | Problem `type` (under `/problems/`) |
-| ---------------------------------------------------- | ---------------------------------------------- | ---------------------- | ----------------------------------- |
-| Customer does not exist when registering a device    | `404 Not Found`                                | whole request          | `customer-not-found`                |
-| Serial number already registered                     | `409 Conflict`                                 | whole request          | `serial-already-registered`         |
-| Customer email already registered                    | `409 Conflict`                                 | whole request          | `email-already-registered`          |
-| Device does not exist (ingesting, `GET` or `PATCH /devices/{id}`) | `404 Not Found`                            | whole request          | `device-not-found`                  |
-| Device is inactive when ingesting                    | `409 Conflict`                                 | whole request          | `device-inactive`                   |
-| Request body is malformed or fails schema validation | `422 Unprocessable Content`                    | whole request          | `validation-error`                  |
-| A single measurement in a batch is invalid           | `207` if others succeeded, `422` if all failed | per item, in `results` | e.g. `unknown-type-unit`            |
-| Duplicate measurement (same id, same payload)        | `201 Created`                                  | per item: `duplicate`  | —                                   |
-| Same `device_measurement_id`, different payload      | `207` / `422` as above                         | per item: `rejected`   | `measurement-id-conflict`           |
-| No route matches the request path                    | `404 Not Found`                                | whole request          | `not-found`                         |
-| The route exists, but not for this HTTP method       | `405 Method Not Allowed` (+ `Allow` header)    | whole request          | `method-not-allowed`                |
-| Readiness check: the database is unreachable         | `503 Service Unavailable`                      | whole request          | `service-unavailable`               |
-| Unexpected error (a bug)                             | `500 Internal Server Error`                    | whole request          | `internal-error`                    |
+Problem types live under `https://api.kamleon.example/problems/`.
 
+#### Customers: `POST /customers`, `GET /customers/{customer_id}`
+
+| Case                              | Status          | Problem `type`             |
+| --------------------------------- | --------------- | -------------------------- |
+| Customer email already registered | `409 Conflict`  | `email-already-registered` |
+| Customer does not exist (`GET`)   | `404 Not Found` | `customer-not-found`       |
+
+#### Devices: `POST/GET /customers/{customer_id}/devices`, `GET /devices/{device_id}`, `GET /devices?serial_number=`
+
+| Case                                               | Status          | Problem `type`              |
+| -------------------------------------------------- | --------------- | --------------------------- |
+| Customer does not exist (register or list devices) | `404 Not Found` | `customer-not-found`        |
+| Serial number already registered                   | `409 Conflict`  | `serial-already-registered` |
+| Device does not exist (`GET /devices/{device_id}`) | `404 Not Found` | `device-not-found`          |
+
+`GET /devices?serial_number=` never returns `404`: an unknown serial is `200` with an empty list.
+
+#### Device status: `PATCH /devices/{device_id}`
+
+| Case                  | Status          | Problem `type`     |
+| --------------------- | --------------- | ------------------ |
+| Device does not exist | `404 Not Found` | `device-not-found` |
+
+#### Measurement ingestion: `POST /devices/{device_id}/measurements`
+
+| Case                                                  | Status                                         | Scope                                     | Problem `type`            |
+| ----------------------------------------------------- | ---------------------------------------------- | ----------------------------------------- | ------------------------- |
+| Device does not exist                                 | `404 Not Found`                                | whole request                             | `device-not-found`        |
+| Device is inactive                                    | `409 Conflict`                                 | whole request                             | `device-inactive`         |
+| Every measurement in the batch is rejected            | `422 Unprocessable Content`                    | whole request, with `summary` + `results` | `batch-rejected`          |
+| A measurement's `(type, unit)` pair is not registered | `207` if others succeeded, `422` if all failed | per item, in `results[].error.type`       | `unknown-type-unit`       |
+| Same `device_measurement_id`, different payload       | `207` if others succeeded, `422` if all failed | per item, in `results[].error.type`       | `measurement-id-conflict` |
+| Duplicate measurement (same id, same payload)         | `201` / `207`                                  | per item: `status: duplicate`             | —                         |
+| Same `device_measurement_id` twice in one batch       | `422 Unprocessable Content`                    | whole request, with `errors`              | `validation-error`        |
+| A measurement's `value` is `NaN` or `±Infinity`       | `422 Unprocessable Content`                    | whole request, with `errors`              | `validation-error`        |
+
+#### Measurement query: `GET /devices/{device_id}/measurements`
+
+| Case                  | Status          | Problem `type`     |
+| --------------------- | --------------- | ------------------ |
+| Device does not exist | `404 Not Found` | `device-not-found` |
+
+#### Health: `GET /health/ready`
+
+| Case                        | Status                    | Problem `type`        |
+| --------------------------- | ------------------------- | --------------------- |
+| The database is unreachable | `503 Service Unavailable` | `service-unavailable` |
+
+#### Any endpoint
+
+| Case                                                          | Status                                      | Problem `type`       |
+| ------------------------------------------------------------- | ------------------------------------------- | -------------------- |
+| Request body, path or query parameters fail schema validation | `422 Unprocessable Content` (with `errors`) | `validation-error`   |
+| No route matches the request path                             | `404 Not Found`                             | `not-found`          |
+| The route exists, but not for this HTTP method                | `405 Method Not Allowed` (+ `Allow` header) | `method-not-allowed` |
+| Unexpected error (a bug)                                      | `500 Internal Server Error`                 | `internal-error`     |
+
+- **Two levels of problem types.** *Whole request* types are the top-level `type` of an error response. *Per item* types appear only inside `results[].error.type` and never as a top-level `type`; a batch in which every measurement is rejected uses `batch-rejected` at the top level.
+- **Two validation levels.** Ingestion goes through two checks in order:
+  1. **Schema validation** (pydantic, before touching the database): a malformed or schema-invalid body is rejected entirely with `422 validation-error`, and no measurement is stored. Errors are located with `errors[].pointer` (body) or `errors[].parameter` (path, query).
+  2. **Storage** (the database): a well-formed measurement that cannot be stored (unregistered pair, id conflict) is reported per item in `results`, so the rest of the batch is still processed.
+- **Why a malformed measurement rejects the whole request instead of one item:** per-item results identify measurements by `device_measurement_id`, which cannot be trusted when the body fails schema validation (it may be missing or not a UUID), so the error is located by position with a JSON Pointer instead. Malformed payloads are firmware serialization bugs that usually affect every measurement. Rejected alternative: validating each item separately and reporting schema errors in `results`; more code, and still impossible for items whose id is the invalid field.
+- **Device-level errors apply to the whole request.** All measurements in a batch belong to the same device, so a missing or inactive device rejects the entire request with a single status and no per-item `results`.
+- **Duplicates are a success.** The firmware only needs to know a measurement is stored so it can clear it from its buffer (see *Status codes*).
 - **Route-level `not-found` is distinct from the domain types** `customer-not-found` and `device-not-found`: it means the URL matches no route, not that a resource is missing.
 - **`internal-error` reveals nothing:** a fixed `detail`, no stack trace and no database message. The error is logged once with its stack trace.
-- **Device-level errors apply to the whole request.** All measurements in a batch belong to the same device, so a missing or inactive device rejects the entire request with a single status and no per-item `results`.
-- **Two validation levels.** A malformed or schema-invalid body is rejected entirely with `422`. A measurement that is well-formed but cannot be stored is reported per item in `results` (see *Batches*), so the rest of the batch is still processed.
-- **Duplicates are a success.** The firmware only needs to know a measurement is stored so it can clear it from its buffer (see *Status codes*).
 - **`409` covers several conflicts, so the problem `type` tells them apart** (`serial-already-registered`, `email-already-registered`, `device-inactive`), see *Error format*. Any `4xx` tells the firmware not to retry.
-**Inactive device → `409`:** the request is valid but conflicts with the current state of the device, the same reasoning as a duplicate serial.
-- **Rejected: `412 Precondition Failed`.** It means a conditional header sent by the client (`If-Match`, `If-Unmodified-Since`) did not hold; the device sends no such condition.
-- **Rejected: `403 Forbidden`.** It fits "not allowed" semantically, but it is commonly read as an authentication/authorization problem, and there is no authentication in this API.
-- **Rejected: `422`.** It means the request data is invalid; here the data is correct.
-
+- **Inactive device → `409`:** the request is valid but conflicts with the current state of the device, the same reasoning as a duplicate serial.
+  - **Rejected: `412 Precondition Failed`.** It means a conditional header sent by the client (`If-Match`, `If-Unmodified-Since`) did not hold; the device sends no such condition.
+  - **Rejected: `403 Forbidden`.** It fits "not allowed" semantically, but it is commonly read as an authentication/authorization problem, and there is no authentication in this API.
+  - **Rejected: `422`.** It means the request data is invalid; here the data is correct.
 
 ### Error format: RFC 9457 (Problem Details)
 
