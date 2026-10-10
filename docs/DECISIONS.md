@@ -209,7 +209,7 @@ A composite index is a single sorted list, not a chain of separate indexes. A lo
 - **Also covers the FK** `measurements.device_id`: Postgres does not index the referencing side of an FK. Since `device_id` is the leading column, this index serves FK checks and cascaded deletes; no separate index is needed.
 **When to revisit this decision**
 
-The choice relies on two assumptions: devices measure few types, and queries without `type` (sync/export, device timeline, internal processing) are common enough to favor time order. Interactive use (one chart per metric) mostly filters by `type`, so if devices measured many types and most queries filtered by type, the index would change to `(device_id, type, "timestamp")`, or both indexes would be kept if both query shapes stay frequent. On Postgres 18+, skip scan makes `(device_id, type, "timestamp")` cheaper for queries without `type`, which further favors the change in that scenario.
+The choice relies on two assumptions: devices measure few types, and queries without `type` (sync/export, device timeline, internal processing) are the most common for data analysis, so the index favors time order. If the real use case were different, for example mostly interactive use (one chart per metric, which filters by `type`) on devices with many types, the index would change to `(device_id, type, "timestamp")`, or both indexes would be kept if both query shapes stay frequent. On Postgres 18+, skip scan makes `(device_id, type, "timestamp")` cheaper for queries without `type`, which further favors the change in that scenario.
 
 The decision would be driven by data, not intuition:
 - identify the most frequent and most expensive queries with `pg_stat_statements`;
@@ -674,7 +674,7 @@ Content-Type: application/problem+json
 
 **Rejected alternative: FastAPI's default error format.** It has two shapes (`{"detail": "text"}` for `HTTPException`, `{"detail": [...]}` for validation errors), so clients must check the type of `detail`. It also has no machine-readable identifier, so the conflicts that share `409` (`device-inactive`, `serial-already-registered`) could only be told apart by comparing message text. Fixing either requires custom exception handlers anyway, and at that point a standard format costs the same as an invented one.
 
-**Implementation:** custom FastAPI exception handlers for `RequestValidationError` and for domain errors, converting them to problem details.
+**Implementation:** custom FastAPI exception handlers for `RequestValidationError` and for application errors (`AppError`, see *Architecture*), converting them to problem details.
 
 ### Querying measurements
 
@@ -759,4 +759,6 @@ Content-Type: application/problem+json
 
 - **Rejected alternative: full hexagonal architecture** (domain entities as dataclasses, repositories mapping rows to them, services never seeing ORM models). It removes all coupling to the ORM, but with three entities the mapping layer is more code than value for this scope.
 - **Trade-off accepted:** services depend on ORM models, so renaming a model attribute touches the services that use it.
+- **Where errors live:** business errors (`DomainError` subclasses) live in `domain/errors.py`. Infrastructure errors that must cross layers, such as `DatabaseUnavailableError`, live in `app/errors.py` together with the common base `AppError`, which the API maps to problem details. A repository raises them, so they cannot live in a service: in a layered architecture dependencies point down, and the repository would import from the layer above. They are not business rules either, so they do not belong in `domain/`.
+  - **Rejected alternative: declaring the error next to the use case** (hexagonal style, where the service owns a port and its errors and the adapter imports them). It fits only with ports and adapters, which were rejected above.
 - **Evolution path:** if the domain grows (more rules, more entities, or a need to change persistence), introduce domain entities and make repositories map to them. The layering already allows it without touching routers.
