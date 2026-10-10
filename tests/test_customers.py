@@ -27,6 +27,13 @@ async def test_create_customer_returns_201_with_location(client: AsyncClient, db
     assert emails == ["ana@kamleon.com"]
 
 
+async def test_openapi_declares_location_header_on_create_customer(client: AsyncClient) -> None:
+    schema = (await client.get("/openapi.json")).json()
+
+    created = schema["paths"]["/customers"]["post"]["responses"]["201"]
+    assert created["headers"]["Location"]["schema"] == {"type": "string"}
+
+
 async def test_get_customer_returns_what_was_created(client: AsyncClient) -> None:
     created = (await client.post("/customers", json=ANA)).json()
 
@@ -80,6 +87,22 @@ async def test_duplicate_email_returns_409_regardless_of_case(
     [record] = [r for r in caplog.records if r.name.startswith("app")]
     assert record.levelno == logging.WARNING
     assert record.exc_info is None
+
+
+async def test_duplicate_email_is_logged_without_the_email(
+    client: AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    await client.post("/customers", json=ANA)
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        response = await client.post("/customers", json=ANA)
+
+    assert response.status_code == 409
+    # The detail is for the client: the log line has only type, status, method and path.
+    [record] = [r for r in caplog.records if r.name.startswith("app")]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "POST /customers -> 409 email-already-registered"
+    assert "ana@kamleon.com" not in caplog.text.lower()
 
 
 @pytest.mark.parametrize(

@@ -100,6 +100,15 @@ def _describe_causes(exc: BaseException) -> str:
     return " <- ".join(causes)
 
 
+def _log_client_error(request: Request, problem: ProblemType) -> None:
+    """A 4xx in one line: problem type, status, method and path only.
+
+    Never the detail: it is written for the client and can contain personal
+    data (e.g. the email in email-already-registered).
+    """
+    logger.warning("%s %s -> %d %s", request.method, request.url.path, problem.status, problem.slug)
+
+
 def _log_one_line(request: Request, problem: ProblemType, summary: str, exc: Exception) -> None:
     causes = _describe_causes(exc)
     logger.warning(
@@ -125,8 +134,13 @@ async def handle_domain_error(request: Request, exc: DomainError) -> JSONRespons
     if problem is None:
         # A domain error without a mapping is a bug: let it become a 500.
         raise exc
-    # The readiness 503 is expected during outages: one line, no stack trace (AGENTS.md, rule 5).
-    if problem.status >= 500 and not isinstance(exc, DatabaseUnavailableError):
+    if problem.status < 500:
+        _log_client_error(request, problem)
+    elif isinstance(exc, DatabaseUnavailableError):
+        # The readiness 503 is expected during outages: one line, no stack trace
+        # (AGENTS.md, rule 5).
+        _log_one_line(request, problem, exc.detail, exc)
+    else:
         logger.error(
             "%s %s -> %d %s: %s",
             request.method,
@@ -136,8 +150,6 @@ async def handle_domain_error(request: Request, exc: DomainError) -> JSONRespons
             exc.detail,
             exc_info=exc,
         )
-    else:
-        _log_one_line(request, problem, exc.detail, exc)
     return problem_response(
         problem, request.url.path, detail=exc.detail, extensions=_domain_extensions(exc)
     )
@@ -171,8 +183,7 @@ def _error_location(error: dict[str, Any]) -> dict[str, str]:
 async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
     # pydantic's "input" is never copied: it can be health data (AGENTS.md, rule 5).
     errors = [_error_location(error) | {"detail": error["msg"]} for error in exc.errors()]
-    summary = "; ".join(f"{next(iter(error.values()))}: {error['detail']}" for error in errors)
-    _log_one_line(request, VALIDATION_ERROR, summary, exc)
+    _log_client_error(request, VALIDATION_ERROR)
     return problem_response(VALIDATION_ERROR, request.url.path, extensions={"errors": errors})
 
 
@@ -181,7 +192,7 @@ async def handle_http_exception(request: Request, exc: HTTPException) -> JSONRes
     phrase = HTTPStatus(exc.status_code).phrase
     problem = ProblemType(exc.status_code, phrase.lower().replace(" ", "-"), phrase)
     detail = exc.detail if exc.detail != phrase else None
-    _log_one_line(request, problem, detail or phrase, exc)
+    _log_client_error(request, problem)
     return problem_response(problem, request.url.path, detail=detail, headers=exc.headers)
 
 

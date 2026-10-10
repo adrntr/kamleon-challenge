@@ -156,3 +156,18 @@ curl -i http://localhost:8000/does-not-exist
 ```
 
 The full list of error cases is in *Error mapping* in `docs/DECISIONS.md`.
+
+## GDPR
+
+The API stores personal data (customer name and email, device serial numbers) and health data (measurement values). Logs are written so that they do not become a second copy of it:
+
+- **Measurement values are never logged.** Ingestion outcomes that are not errors (duplicates, rejected items) are logged as one aggregated line per outcome, with the device id, count, type and unit only.
+- **Client errors (`4xx`)** are logged at `warning` with the method, path, status and problem type only. The problem `detail` is not logged, since it can contain personal data (e.g. the email in `email-already-registered`). The path carries ids (`customer_id`, `device_id`), never emails or names.
+- **Server errors (`5xx`)** are logged at `error` with the cause chain and stack trace, which are needed to fix the bug. They are unexpected by definition, so they are rare, but a database error message in the cause can quote the values of the failing row.
+- **Access logs** are uvicorn's defaults: client IP and the full request line, including the query string (e.g. `?serial_number=KM123`). Retention and access control for logs belong to the deployment. **Future improvement:** replace the default access log with one that writes the path without the query string, like the error logs do.
+
+**Erasure:** deleting a customer deletes their devices and measurements through `ON DELETE CASCADE` (see *Customer deletion* in `docs/DECISIONS.md`). There is no delete endpoint yet, so an erasure request is executed in the database:
+
+```sql
+DELETE FROM customers WHERE id = '<customer_id>';
+```
