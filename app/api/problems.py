@@ -14,13 +14,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.domain.errors import (
     BatchRejectedError,
     CustomerNotFoundError,
-    DatabaseUnavailableError,
     DeviceInactiveError,
     DeviceNotFoundError,
-    DomainError,
     EmailAlreadyRegisteredError,
     SerialAlreadyRegisteredError,
 )
+from app.errors import AppError, DatabaseUnavailableError
 from app.schemas.measurement import MeasurementBatchRead
 from app.schemas.problem import PROBLEM_TYPE_BASE, ProblemDetails
 
@@ -45,8 +44,8 @@ class ProblemType:
 VALIDATION_ERROR = ProblemType(422, "validation-error", "Request validation failed")
 INTERNAL_ERROR = ProblemType(500, "internal-error", "Internal server error")
 
-# The domain layer knows nothing about HTTP: statuses and problem types are assigned here.
-DOMAIN_PROBLEMS: dict[type[DomainError], ProblemType] = {
+# Errors know nothing about HTTP: statuses and problem types are assigned here.
+APP_PROBLEMS: dict[type[AppError], ProblemType] = {
     DatabaseUnavailableError: ProblemType(503, "service-unavailable", "Service unavailable"),
     CustomerNotFoundError: ProblemType(404, "customer-not-found", "Customer not found"),
     EmailAlreadyRegisteredError: ProblemType(
@@ -122,17 +121,17 @@ def _log_one_line(request: Request, problem: ProblemType, summary: str, exc: Exc
     )
 
 
-def _domain_problem(exc: DomainError) -> ProblemType | None:
+def _app_problem(exc: AppError) -> ProblemType | None:
     for cls in type(exc).__mro__:
-        if cls in DOMAIN_PROBLEMS:
-            return DOMAIN_PROBLEMS[cls]
+        if cls in APP_PROBLEMS:
+            return APP_PROBLEMS[cls]
     return None
 
 
-async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
-    problem = _domain_problem(exc)
+async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
+    problem = _app_problem(exc)
     if problem is None:
-        # A domain error without a mapping is a bug: let it become a 500.
+        # An error without a mapping is a bug: let it become a 500.
         raise exc
     if problem.status < 500:
         _log_client_error(request, problem)
@@ -151,11 +150,11 @@ async def handle_domain_error(request: Request, exc: DomainError) -> JSONRespons
             exc_info=exc,
         )
     return problem_response(
-        problem, request.url.path, detail=exc.detail, extensions=_domain_extensions(exc)
+        problem, request.url.path, detail=exc.detail, extensions=_app_extensions(exc)
     )
 
 
-def _domain_extensions(exc: DomainError) -> dict[str, Any] | None:
+def _app_extensions(exc: AppError) -> dict[str, Any] | None:
     if isinstance(exc, BatchRejectedError):
         # The same summary and results as a 201/207 body (DECISIONS.md, Batches).
         return MeasurementBatchRead.from_result(exc.result).model_dump(
@@ -235,5 +234,5 @@ class UnhandledErrorMiddleware:
 def register_error_handlers(app: FastAPI) -> None:
     app.add_middleware(UnhandledErrorMiddleware)
     app.add_exception_handler(RequestValidationError, handle_validation_error)
-    app.add_exception_handler(DomainError, handle_domain_error)
+    app.add_exception_handler(AppError, handle_app_error)
     app.add_exception_handler(HTTPException, handle_http_exception)

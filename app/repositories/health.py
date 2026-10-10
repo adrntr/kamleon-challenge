@@ -2,7 +2,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.errors import DatabaseUnavailableError
+from app.errors import DatabaseUnavailableError
 
 
 async def ping(session: AsyncSession) -> None:
