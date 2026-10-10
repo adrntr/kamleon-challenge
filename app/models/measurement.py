@@ -17,7 +17,7 @@ class Measurement(Base):
         Index(None, "device_id", "timestamp", "type"),
     )
 
-    # No default: the service generates it with uuid.uuid7() (DECISIONS.md, Identifiers).
+    # No default: the repository generates it with uuid.uuid7() (DECISIONS.md, Identifiers).
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     device_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"))
     device_measurement_id: Mapped[uuid.UUID]

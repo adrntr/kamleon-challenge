@@ -16,6 +16,14 @@ router = APIRouter(prefix="/devices", tags=["devices"])
     "",
     status_code=201,
     responses={
+        201: {
+            "headers": {
+                "Location": {
+                    "description": "URL of the created device",
+                    "schema": {"type": "string"},
+                }
+            }
+        },
         404: {**PROBLEM_RESPONSE, "description": "Customer not found (customer-not-found)"},
         409: {
             **PROBLEM_RESPONSE,

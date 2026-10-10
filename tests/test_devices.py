@@ -42,6 +42,13 @@ async def test_create_device_returns_201_active_with_location(client: AsyncClien
     assert body["updated_at"].endswith(("Z", "+00:00"))
 
 
+async def test_openapi_declares_location_header_on_create_device(client: AsyncClient) -> None:
+    schema = (await client.get("/openapi.json")).json()
+
+    created = schema["paths"]["/customers/{customer_id}/devices"]["post"]["responses"]["201"]
+    assert created["headers"]["Location"]["schema"] == {"type": "string"}
+
+
 async def test_create_device_for_unknown_customer_returns_404(client: AsyncClient) -> None:
     customer_id = uuid.uuid4()
 

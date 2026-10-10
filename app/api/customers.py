@@ -14,6 +14,14 @@ router = APIRouter(prefix="/customers", tags=["customers"])
     "",
     status_code=201,
     responses={
+        201: {
+            "headers": {
+                "Location": {
+                    "description": "URL of the created customer",
+                    "schema": {"type": "string"},
+                }
+            }
+        },
         409: {
             **PROBLEM_RESPONSE,
             "description": "Email already registered (email-already-registered)",
